@@ -3249,6 +3249,23 @@ def forward(self, x):
         with self.assertRaisesRegex(RuntimeError, "shape\[0\] to be >= 3, but got 2"):
             ep.module()(*test_inp)
 
+    def test_nested_module(self):
+        class M1(torch.nn.Module):
+            def forward(self, x):
+                return x + x
+
+        class M2(torch.nn.Module):
+            def forward(self, x):
+                m = M1()
+                return m(x) * x
+
+        inps = (torch.randn(3, 3),)
+        ep = export(M2(), inps)
+        self.assertTrue(torch.allclose(ep.module()(*inps), M2()(*inps)))
+
+        unflattened = unflatten(ep)
+        self.assertTrue(torch.allclose(unflattened(*inps), M2()(*inps)))
+
     def test_lazy_module_kwargs(self):
         class LazyModule(torch.nn.modules.lazy.LazyModuleMixin, torch.nn.Module):
             def initialize_parameters(self, *args, **kwargs):

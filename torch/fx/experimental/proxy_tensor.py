@@ -29,6 +29,7 @@ from torch.utils._stats import count
 from torch.utils._traceback import CapturedTraceback
 import logging
 from torch._library.fake_class_registry import FakeScriptObject
+import warnings
 
 from torch.overrides import TorchFunctionMode
 
@@ -1082,7 +1083,17 @@ class _ModuleStackTracer(PythonKeyTracer):
         # use cases don't need to work with HOO.
         if isinstance(m, (OptimizedModule, GraphModule)):
             return forward(*args, **kwargs)
-        return Tracer.call_module(self, m, forward, args, kwargs)
+
+        try:
+            return Tracer.call_module(self, m, forward, args, kwargs)
+        except NameError as e:
+            warnings.warn(
+                f"Unable to find the path of the module {m}. "
+                "This might be because the module was not properly registered "
+                "as a submodule, which is not good practice. We will trace "
+                "through the module without recording stack information."
+            )
+            return forward(*args, **kwargs)
 
 
     def is_leaf_module(self, m, module_qualified_name):
