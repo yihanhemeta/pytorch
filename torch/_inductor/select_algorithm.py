@@ -309,7 +309,7 @@ class TritonTemplateKernel(TritonKernel):
         with V.set_ops_handler(PlaceholderSubstitution(V.ops)):
             assert isinstance(
                 subgraph, ir.ComputedBuffer
-            ), "Expected the subgraph to be a ComputedBuffer"
+            ), f"Expected the subgraph to be a ComputedBuffer, got {type(subgraph)}"
             if isinstance(subgraph.data, ir.InputBuffer):
                 out = subgraph.data.make_loader()((1,))
             else:

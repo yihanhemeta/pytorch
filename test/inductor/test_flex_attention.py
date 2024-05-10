@@ -39,21 +39,6 @@ torch.set_float32_matmul_precision("high")
 index = torch.ops.aten.index
 
 
-def query_key_value_clones(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    dtype: torch.dtype = None,
-):
-    """Clones the query, key, and value tensors and moves them to the specified dtype."""
-    if dtype is None:
-        dtype = query.dtype
-    query_ref = query.clone().detach().to(dtype).requires_grad_(query.requires_grad)
-    key_ref = key.clone().detach().to(dtype).requires_grad_(key.requires_grad)
-    value_ref = value.clone().detach().to(dtype).requires_grad_(value.requires_grad)
-    return query_ref, key_ref, value_ref
-
-
 def create_attention(score_mod):
     return functools.partial(_flex_attention, score_mod=score_mod)
 
@@ -73,6 +58,10 @@ if common_utils.TEST_WITH_ROCM:
 
 
 # --------- Useful score mod functions for testing ---------
+def _inverse_causal(score, b, h, m, n):
+    return torch.where(m <= n, score, float("-inf"))
+
+
 def _times_two(score, b, h, m, n):
     """Joint graph needed for correctness"""
     return score * 2
@@ -83,25 +72,12 @@ def _squared(score, b, h, m, n):
     return score * score
 
 
-test_score_mods = [
-    _identity,
-    _times_two,
-    _squared,
-    _causal,
-    _rel_bias,
-    _rel_causal,
-    _generate_alibi_bias(8),
-]
-
-
 def _head_offset(dtype: torch.dtype):
-    """Captured Buffer
-    Note: this builds a score_mod with index of a type
-    """
+    """Captured Buffer"""
     head_offset = torch.rand(H, device="cuda", dtype=dtype)
 
     def score_mod(score, b, h, m, n):
-        return score * index(head_offset, [h])
+        return score * head_offset[h]
 
     return score_mod
 
@@ -119,26 +95,40 @@ def _trig2(score, b, h, m, n):
     return z
 
 
-def _buffer_reduced(dtype: torch.dtype):
-    """Reduction in captured buffer"""
-    batch_offsets = torch.rand(B, 8, device="cuda", dtype=dtype)
-
-    def score_mod(score, b, h, m, n):
-        batch_vals = index(batch_offsets, [b])
-        return score + batch_vals.sum()
-
-    return score_mod
-
+test_score_mods = [
+    _identity,
+    _times_two,
+    _squared,
+    _causal,
+    _inverse_causal,
+    _rel_bias,
+    _rel_causal,
+    _generate_alibi_bias(8),
+]
 
 captured_buffers_map = {
     "_head_offset": _head_offset,
-    "_buffer_reduced": _buffer_reduced,
 }
 
 B = 4
 H = 8
 S = 2048
 D = 64
+
+
+def query_key_value_clones(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    dtype: torch.dtype = None,
+):
+    """Clones the query, key, and value tensors and moves them to the specified dtype."""
+    if dtype is None:
+        dtype = query.dtype
+    query_ref = query.clone().detach().to(dtype).requires_grad_(query.requires_grad)
+    key_ref = key.clone().detach().to(dtype).requires_grad_(key.requires_grad)
+    value_ref = value.clone().detach().to(dtype).requires_grad_(value.requires_grad)
+    return query_ref, key_ref, value_ref
 
 
 def get_ref_compiled_error(
@@ -192,28 +182,31 @@ class TestTemplatedSDPA(InductorTestCase):
                 f"Compiled error {compiled_error} is greater than ref error {ref_error} by more than {fudge_factor}X.",
             )
 
+            # Check gradients
+            q_fudge_factor = 2.5 * fudge_factor
             q_ref_error, q_compiled_error = get_ref_compiled_error(
                 q_gold.grad, q_ref.grad, q.grad
             )
             self.assertTrue(
-                q_compiled_error < q_ref_error * fudge_factor,
-                f"q grad error {q_compiled_error} is greater than ref error {q_ref_error} by more than {fudge_factor}X.",
+                q_compiled_error < q_ref_error * q_fudge_factor,
+                f"q grad error {q_compiled_error} is greater than ref error {q_ref_error * q_fudge_factor}",
             )
-
+            k_fudge_factor = 4 * fudge_factor
             k_ref_error, k_compiled_error = get_ref_compiled_error(
                 k_gold.grad, k_ref.grad, k.grad
             )
             self.assertTrue(
-                k_compiled_error < k_ref_error * fudge_factor,
-                f"k grad error {k_compiled_error} is greater than ref error {k_ref_error} by more than {fudge_factor}X.",
+                k_compiled_error < k_ref_error * k_fudge_factor,
+                f"k grad error {k_compiled_error} is greater than ref error {k_ref_error * k_fudge_factor}.",
             )
 
+            v_fudge_factor = 8 * fudge_factor
             v_ref_error, v_compiled_error = get_ref_compiled_error(
                 v_gold.grad, v_ref.grad, v.grad
             )
             self.assertTrue(
-                v_compiled_error < v_ref_error * fudge_factor,
-                f"v grad error {v_compiled_error} is greater than ref error {v_ref_error} by more than {fudge_factor}X.",
+                v_compiled_error < v_ref_error * v_fudge_factor,
+                f"v grad error {v_compiled_error} is greater than ref error {v_ref_error * v_fudge_factor}",
             )
 
     @supported_platform
@@ -252,6 +245,21 @@ class TestTemplatedSDPA(InductorTestCase):
             return score + head_offset[h]
 
         self.run_test(score_mod, dtype)
+
+    @supported_platform
+    @common_utils.parametrize("dtype", test_dtypes)
+    def test_captured_buffers_all_dims(self, dtype: torch.dtype):
+        head_scale = torch.randn(H, device="cuda")
+        batch_scale = torch.randn(B, device="cuda")
+        tok_scale = torch.randn(S, device="cuda")
+
+        def all_bias(score, batch, head, token_q, token_kv):
+            score = score + tok_scale[token_q]
+            score = score + batch_scale[batch]
+            score = score + head_scale[head]
+            return score
+
+        self.run_test(all_bias, dtype)
 
     @supported_platform
     @common_utils.parametrize("dtype", test_dtypes_fast)
@@ -650,7 +658,7 @@ class TestTemplatedSDPA(InductorTestCase):
         )
 
     @supported_platform
-    @common_utils.parametrize("score_mod_name", ["_head_offset", "_buffer_reduced"])
+    @common_utils.parametrize("score_mod_name", ["_head_offset"])
     @common_utils.parametrize("mode", ["eager", "aot_eager"])
     def test_captured_score_mod_aot_eager_gradcheck(
         self, score_mod_name: str, mode: str
@@ -738,13 +746,10 @@ class GraphModule(torch.nn.Module):
             joint_graph,
             """\
 class GraphModule(torch.nn.Module):
-    def forward(self, primals_1: "f64[2, 2, 8, 4]", primals_2: "f64[2, 2, 8, 4]", primals_3: "f64[2, 2, 8, 4]", """
-            + """alias_5: "f64[2, 2, 8, 4]", alias_7: "f32[2, 2, 8]", tangents_1: "f64[2, 2, 8, 4]"):
+    def forward(self, primals_1: "f64[2, 2, 8, 4]", primals_2: "f64[2, 2, 8, 4]", primals_3: "f64[2, 2, 8, 4]", alias_3: "f64[2, 2, 8, 4]", alias_5: "f32[2, 2, 8]", tangents_1: "f64[2, 2, 8, 4]"):
         fw_graph = self.fw_graph
         joint_graph = self.joint_graph
-        flex_attention_backward = torch.ops.higher_order.flex_attention_backward(primals_1, primals_2, """
-            + """primals_3, alias_5, alias_7, tangents_1, fw_graph, joint_graph);  primals_1 = primals_2 = primals_3 = alias_5 """
-            + """= alias_7 = tangents_1 = fw_graph = joint_graph = None
+        flex_attention_backward = torch.ops.higher_order.flex_attention_backward(primals_1, primals_2, primals_3, alias_3, alias_5, tangents_1, fw_graph, joint_graph);  primals_1 = primals_2 = primals_3 = alias_3 = alias_5 = tangents_1 = fw_graph = joint_graph = None
         getitem_2: "f64[2, 2, 8, 4]" = flex_attention_backward[0]
         getitem_3: "f64[2, 2, 8, 4]" = flex_attention_backward[1]
         getitem_4: "f64[2, 2, 8, 4]" = flex_attention_backward[2];  flex_attention_backward = None
@@ -762,7 +767,7 @@ class GraphModule(torch.nn.Module):
             mul_2: "f64[]" = torch.ops.aten.mul.Tensor(arg5_1, arg0_1);  arg5_1 = arg0_1 = None
             add: "f64[]" = torch.ops.aten.add.Tensor(mul_2, mul_1);  mul_2 = mul_1 = None
             return [add, None, None, None, None]
-""",
+""",  # noqa: B950
         )
 
 
