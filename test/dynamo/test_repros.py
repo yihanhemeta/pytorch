@@ -3346,8 +3346,7 @@ class ReproTests(torch._dynamo.test_case.TestCase):
             return y
 
         x = {"a": torch.tensor([1]), "b": torch.tensor([1])}
-        # FIXME It should be KeyError here
-        self.assertRaises(torch._dynamo.exc.InternalTorchDynamoError, lambda: fn(x))
+        self.assertRaises(KeyError, lambda: fn(x))
 
     def test_attached_attribute_in_dir(self):
         class MyModule(torch.nn.Module):
@@ -4933,6 +4932,20 @@ def forward(self, primals_1, primals_2):
         data = torch.randn(3, 4)
         opt_ladder = torch.compile(ladder, fullgraph=True, backend="eager")
         self.assertEqual(opt_ladder(data), ladder(data))
+
+    def test_const_dict_keyerror(self):
+        d = {}
+
+        def fn(x):
+            try:
+                y = d[0]
+            except KeyError:
+                y = 1
+            return x + y
+
+        opt_fn = torch.compile(fn, backend="eager")
+        inp = torch.randn(3, 3)
+        self.assertEqual(fn(inp), opt_fn(inp))
 
 
 instantiate_parametrized_tests(ReproTests)
