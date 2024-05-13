@@ -783,14 +783,6 @@ class FakeTensorTest(TestCase):
         self.checkType(r3, "cpu", (4, 4))
         self.checkType(out, "cpu", (4, 4))
 
-    def test__adaptive_avg_pool2d_backward(self):
-        with FakeTensorMode():
-            grad_out = torch.rand(2, 3, 4, 4)
-            inp = torch.rand(2, 3, 4, 4).to(memory_format=torch.channels_last)
-            grad_in = torch.ops.aten._adaptive_avg_pool2d_backward(grad_out, inp)
-            print("debug 2d print channels last", torch._prims_common.suggest_memory_format(grad_in), torch.channels_last_3d)
-            self.assertTrue(torch._prims_common.suggest_memory_format(grad_in) == torch.channels_last)
-
     def test__adaptive_avg_pool3d_backward(self):
         with FakeTensorMode():
             grad_out = torch.rand(2, 3, 4, 4, 4)
@@ -799,8 +791,18 @@ class FakeTensorTest(TestCase):
             print("debug 3d print channels last", torch._prims_common.suggest_memory_format(grad_in), torch.channels_last_3d)
             self.assertTrue(torch._prims_common.suggest_memory_format(grad_in) == torch.channels_last_3d)
 
+    def test__adaptive_avg_pool2d_backward(self):
+        with FakeTensorMode():
+            grad_out = torch.rand(2, 3, 4, 4)
+            inp = torch.rand(2, 3, 4, 4).to(memory_format=torch.channels_last)
+            grad_in = torch.ops.aten._adaptive_avg_pool2d_backward(grad_out, inp)
+            print("debug 2d print channels last", torch._prims_common.suggest_memory_format(grad_in), torch.channels_last_3d)
+            self.assertTrue(torch._prims_common.suggest_memory_format(grad_in) == torch.channels_last)
+            self.assertTrue(False)
+
     # Propagate real tensors doesn't work when original input arguments are
     # fake
+
     @expectedFailurePropagateRealTensors
     def test_export_numpy(self):
         class MyNumpyModel(torch.nn.Module):
